@@ -55,10 +55,6 @@ pub struct CoinsItem {
     pub symbol: String,
     pub name: String,
     pub image: Image,
-    pub contract_address: Option<String>,
-    pub sentiment_votes_up_percentage: Value,
-    pub sentiment_votes_down_percentage: Value,
-    pub market_cap_rank: Value,
     pub market_data: Option<MarketData>,
 }
 
@@ -72,17 +68,13 @@ pub struct Image {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct MarketData {
     pub current_price: CurrencyOption,
-    pub roi: Value,
     pub ath: CurrencyOption,
     pub atl: CurrencyOption,
-    pub market_cap:CurrencyOption,
     pub market_cap_rank: Value,
-    pub total_volume: CurrencyOption,
     #[serde(rename = "price_change_percentage_1h_in_currency")]
     pub price_change_percentage1_h_in_currency: Option<CurrencyOption>,
     #[serde(rename = "price_change_percentage_24h_in_currency")]
     pub price_change_percentage24_h_in_currency: Option<CurrencyOption>,
-    pub last_updated: String,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone,FieldAccessor)]

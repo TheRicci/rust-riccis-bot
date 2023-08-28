@@ -1,11 +1,12 @@
 mod commands;
 mod coingecko;
+mod twelvedata;
 
 use rand::Rng;
 use dotenv;
 use log::{info, error,debug};
 use std::collections::{HashMap, HashSet};
-use std::env;
+use std::{env, vec};
 use std::sync::Arc;
 use serenity::model::application::interaction::{Interaction, InteractionResponseType,MessageFlags};
 use std::{time,thread};
@@ -40,6 +41,8 @@ use serenity::model::id::UserId;
 use serenity::prelude::*;
 use tokio::sync::Mutex;
 
+use redis::{Commands, JsonCommands, ErrorKind};
+
 struct ShardManagerContainer;
 
 impl TypeMapKey for ShardManagerContainer {
@@ -51,14 +54,19 @@ impl TypeMapKey for GeckoClient {
     type Value = Arc<coingecko::CoinGeckoClient>;
 }
 
-struct CoinInfo {
-    updated_at:time::Instant ,
-    coins_item: coingecko::CoinsItem
+struct StonksClient;
+impl TypeMapKey for StonksClient {
+    type Value = Arc<twelvedata::TwelveDataClient>;
 }
 
-struct CoingeckoCoins;
-impl TypeMapKey for CoingeckoCoins {
-    type Value = Arc<RwLock<HashMap<String, CoinInfo>>>;
+struct RedisClient;
+impl TypeMapKey for RedisClient {
+    type Value = Arc<redis::Client>;
+}
+
+struct CountriesMap;
+impl TypeMapKey for CountriesMap {
+    type Value = Arc<HashMap<String, HashSet<String>>>;
 }
 
 struct CoingeckoIDMap;
@@ -115,91 +123,111 @@ impl EventHandler for Handler {
         // tokio::spawn creates a new green thread that can run in parallel with the rest of
         // the application.
         tokio::spawn(async move {
-            let (mut socket, _) = connect(
-                Url::parse("wss://stream.binance.com:9443/ws/bitcoinusdt@kline_1s").unwrap()
-            ).expect("Can't connect");
-           
-           let (mut timer1, mut timer2) = (time::Instant::now(), time::Instant::now());
-           let mut coin:Option<coingecko::CoinsItem> = None;
-
-            loop {
-                let msg = socket.read_message().expect("Error reading message");
-                match msg {
-                    TunMessage::Text(t) =>{
-                        let parsed: serde_json::Value = serde_json::from_str(&t).expect("Can't parse to JSON");
-                        if time::Instant::now().duration_since(timer1).as_secs() < 20{
-                            continue;
-                        }
-                        let context_data_map = ctx1.data.read().await;
-                        let coins_lock = match context_data_map.get::<CoingeckoCoins>(){
-                            Some(m) => m,
-                            None =>  {error!("failed to get coins map"); continue}
-                           };
-                        
-                        timer1 = time::Instant::now();
-                        if time::Instant::now().duration_since(timer2).as_secs() > 240 || coin.is_none(){
-                            let coingecko_client = match context_data_map.get::<GeckoClient>(){
-                                Some(c) => c,
-                                None => {error!("failed to get coingecko client object"); continue}
-                            };
-                            match coingecko_client.coin("bitcoin", false, false, true, false, false, false).await{
-                                Ok(c) => {
-                                    let mut map_coins_write_lock = coins_lock.write().await;
-                                    map_coins_write_lock.insert(c.id.clone(), CoinInfo{coins_item: c.clone(),updated_at: time::Instant::now()}); 
-                                    debug!("requested and updated bitcoin");
-                                    coin = Some(c);
-                                }
-                                Err(y) =>{error!("error while requesting coingecko: {y}"); continue}
-                            }
-                        timer2 = time::Instant::now();
-                        }else{
-                            let map_coins_read_lock = coins_lock.read().await; 
-                            match map_coins_read_lock.get("bitcoin")  {
-                                Some(c) => coin = Some(c.coins_item.clone()),
-                                None => {error!("failed to get bitcoin data"); continue}
-                            };
-                        }
-                       
-                        let one_day =  match &coin {
-                            Some(c) => match &c.market_data{
-                                Some(d) => match &d.price_change_percentage24_h_in_currency{
-                                    Some(currency) =>match currency.usd {
-                                        Some(f) => f,
-                                        None => {error!("no usd for one day data"); continue},
-                                    }
-                                    None => {error!("no one day change data"); continue},
-                                }
-                                None => {error!("no bitcoin market data stored"); continue},
-                            }
-                            None => {error!("no bitcoin data stored"); continue},
-                        };
-                        
-                        let price = parsed["k"]["c"].as_str().unwrap();
-                        ctx1.set_activity(Activity::watching(format!("$ {} {} {}%",format_price(price.trim().parse().unwrap()).separate_with_commas(),check_direction(&one_day,true),add_sign(one_day)))).await;
-                        if one_day.is_sign_positive(){ctx1.online().await}else{ctx1.dnd().await}
-                        }
-                       
-                    TunMessage::Ping(t) => {
-                        socket.write_message(TunMessage::Pong(t)).expect("failed to pong");
-                    }
-                    _ => {}
-                }
-
+            loop{
+                let (mut socket, _) = connect(
+                    Url::parse("wss://stream.binance.com:9443/ws/bitcoinusdt@kline_1s").unwrap()
+                ).expect("Can't connect to binance.");
                 
+                let (mut timer1, mut timer2) = (time::Instant::now(), time::Instant::now());
+                let mut coin:Option<coingecko::CoinsItem> = None;
+    
+                loop {
+                    let msg = socket.read_message().expect("Error reading message");
+                
+                    match msg {
+                        TunMessage::Text(t) =>{
+                            let parsed: serde_json::Value = serde_json::from_str(&t).expect("Can't parse to JSON");
+                            if time::Instant::now().duration_since(timer1).as_secs() < 20{
+                                continue;
+                            }
+                            let context_data_map = ctx1.data.read().await;
+
+                            let redis_client =  match context_data_map.get::<RedisClient>(){
+                                Some(r) => r.clone(),
+                                None => {error!("there was a problem getting redis client."); continue} 
+                            };
+                            let mut con = match redis_client.get_connection(){
+                                Ok(c) => c,
+                                Err(y) => {error!("{y}"); continue}
+                            };                               
+                            
+                            timer1 = time::Instant::now();
+                            if time::Instant::now().duration_since(timer2).as_secs() > 240 || coin.is_none(){
+                                let coingecko_client = match context_data_map.get::<GeckoClient>(){
+                                    Some(c) => c.clone(),
+                                    None => {error!("failed to get coingecko client object"); continue}
+                                };
+                                match coingecko_client.coin("bitcoin", false, false, true, false, false, false).await{
+                                    Ok(c) => {
+                                        match con.json_set(format!("crypto:bitcoin"), "$",&c){
+                                            Ok(()) => match con.expire(format!("crypto:bitcoin"), 300) {
+                                                Ok(()) =>  debug!("stored new cache for bitcoin."),
+                                                Err(y) => {error!("{y}"); continue}
+                                            },
+                                            Err(y) => {error!("{y}"); continue}
+                                        }
+                                        coin = Some(c);
+                                    }
+                                    Err(y) =>{error!("error while requesting coingecko: {y}"); continue}
+                                }
+
+                            timer2 = time::Instant::now();
+                            }else{
+                                let coin_redis_resp:Option<String> = match con.json_get(format!("crypto:bitcoin"), "$"){
+                                    Ok(c) => c,
+                                    Err(y) => if let ErrorKind::TypeError = y.kind() {
+                                        None
+                                    }else{error!("{}",y.to_string().to_lowercase()); continue}
+                                };
+                        
+                                match coin_redis_resp {
+                                    Some(c) =>{
+                                        let c:Vec<coingecko::CoinsItem> = serde_json::from_str(&c).unwrap();
+                                        coin = Some(c[0].clone());
+                                        debug!("used cache for bitcoin.")
+                                    }None =>{error!("bitcoin coingecko data not found on redis."); continue}
+                                }
+                            }
+                        
+                            let one_day =  match &coin {
+                                Some(c) => match &c.market_data{
+                                    Some(d) => match &d.price_change_percentage24_h_in_currency{
+                                        Some(currency) =>match currency.usd {
+                                            Some(f) => f,
+                                            None => {error!("no usd for one day data"); continue},
+                                        }
+                                        None => {error!("no one day change data"); continue},
+                                    }
+                                    None => {error!("no bitcoin market data stored"); continue},
+                                }
+                                None => {error!("no bitcoin data stored"); continue},
+                            };
+                            
+                            let price = parsed["k"]["c"].as_str().unwrap();
+                            ctx1.set_activity(Activity::watching(format!("$ {} {} {}%",format_price(price.trim().parse().unwrap()).separate_with_commas(),check_direction(&one_day,true),add_sign(one_day)))).await;
+                            if one_day.is_sign_positive(){ctx1.online().await}else{ctx1.dnd().await}
+                            }
+                        
+                        TunMessage::Ping(t) => {
+                            socket.write_message(TunMessage::Pong(t)).expect("failed to pong");
+                        }
+                        _ => break
+                    }    
+                }
             }
-            });
+        });
 
     }
 }
 
 #[group]
 #[only_in(guilds)]
-#[commands(about,delete)]
+#[commands(about,delete,stonk_price)]
 struct General;
 
 #[group]
 #[only_in(guilds)]
-#[commands(price,index)]
+#[commands(crypto_price,index)]
 struct Crypto;
 
 #[group]
@@ -251,14 +279,12 @@ async fn after(ctx: &Context, msg: &Message, _command_name: &str, command_result
         Ok(()) => info!("Command '{}', by user '{}, from: {} processed succesfuly.'",msg.content,msg.author.name,guild_name),
         Err(why) =>{
             let w = why.to_string();
-            let collection: Vec<&str> = w.split("--").collect();
-            error!("Command '{}', by user '{}, from: {} had an error: {}",msg.content,msg.author.name,guild_name,collection[0]);
-            if collection.len() == 1{
-                let _ = msg.reply(ctx,collection[0]).await;
+            error!("Command '{}', by user '{}, from: {} had an error: {}",msg.content,msg.author.name,guild_name,w);
+            if w.chars().next().unwrap().is_uppercase(){
+                let _ = msg.reply(ctx,w).await;
             }else{
-                let _ = msg.reply(ctx,collection[1]).await;
+                let _ = msg.reply(ctx,"Internal Error.").await;
             }
-            
         } 
     }
 }
@@ -339,10 +365,11 @@ async fn main() {
         .framework(framework)
         .await
         .expect("Err creating client");
-
+    
+    let redis_client = redis::Client::open("redis://127.0.0.1/").expect("failed to connect to connect to Redis");
     
     let coingecko_client = coingecko::CoinGeckoClient::new("https://api.coingecko.com/api/v3");
-    let coins = coingecko_client.coins_list(false).await.unwrap();
+    let coins = coingecko_client.coins_list(false).await.expect("failed to fetch coins list");
     let mut coins_map_symbol: HashMap<String,String> = HashMap::default();
     let mut coins_map_name: HashMap<String,String> = HashMap::default();
     let mut coins_map_id: HashMap<String,String> = HashMap::default();
@@ -351,7 +378,28 @@ async fn main() {
             coins_map_name.insert(coin.name.to_lowercase(),  coin.id.clone());
             let _ = coins_map_symbol.entry(coin.symbol.to_lowercase()).or_insert(coin.id);
         };
+    
+    let twelvedata_client = twelvedata::TwelveDataClient::new("https://twelve-data1.p.rapidapi.com");
+    let stocks = twelvedata_client.stocks_list().await.expect("failed to fetch stocks list");
+    let indices = twelvedata_client.indices_list().await.expect("failed to fetch indices list");
+    let etfs = twelvedata_client.etfs_list().await.expect("failed to fetch etfs list");
+    let mut symbols_map: HashMap<String,HashSet<String>> = HashMap::default();
 
+    for stock in stocks.data{
+        let map = symbols_map.entry(stock.country.to_lowercase()).or_insert(HashSet::default());
+        map.insert(stock.symbol.to_lowercase());
+
+    }
+    for i in indices.data{
+        let map = symbols_map.entry(i.country.to_lowercase()).or_insert(HashSet::default());
+        map.insert(i.symbol.to_lowercase());
+    }
+    for etf in etfs.data{
+        let map = symbols_map.entry(etf.country.to_lowercase()).or_insert(HashSet::default());
+        map.insert(etf.symbol.to_lowercase());
+
+    }
+    
     {
         let mut data = client.data.write().await;
         data.insert::<ShardManagerContainer>(Arc::clone(&client.shard_manager));
@@ -359,7 +407,10 @@ async fn main() {
         data.insert::<CoingeckoIDMap>(Arc::new(coins_map_id));
         data.insert::<SymbolCoingeckoIDMap>(Arc::new(coins_map_symbol));
         data.insert::<NameCoingeckoIDMap>(Arc::new(coins_map_name));
-        data.insert::<CoingeckoCoins>(Arc::new(RwLock::new(HashMap::default())));
+        data.insert::<StonksClient>(Arc::new(twelvedata_client));
+        data.insert::<CountriesMap>(Arc::new(symbols_map));
+        data.insert::<RedisClient>(Arc::new(redis_client))
+
     }
 
     if let Err(why) = client.start().await {
@@ -385,8 +436,7 @@ async fn index(ctx: &Context, msg: &Message) -> CommandResult {
     let _ = msg.channel_id.send_message(&ctx.http,
     |c| c.add_embed(
         |e|e.image(format!("https://alternative.me/crypto/fear-and-greed-index.png?{rng}"))
-    )
-    ).await;
+    )).await;
 
     Ok(())
 }
@@ -471,7 +521,7 @@ async fn slow_mode(ctx: &Context, msg: &Message, mut args: Args) -> CommandResul
         let slow_mode_rate = channel.rate_limit_per_user.unwrap_or(0);
         msg.channel_id.say(&ctx.http,format!("Current slow mode rate is `{}` seconds.", slow_mode_rate)).await?;
     } else {
-        return Err(CommandError::from("Failed to find channel in cache."));
+        return Err(CommandError::from("failed to find channel in cache."));
     };
 
     Ok(())
@@ -486,7 +536,7 @@ async fn slow_mode(ctx: &Context, msg: &Message, mut args: Args) -> CommandResul
 #[example = ".p bitcoin"]
 #[example = ".p btc"]
 #[example = ".p btc/eur"]
-async fn price(ctx: &Context,msg: &Message,mut args: Args) -> CommandResult {
+async fn crypto_price(ctx: &Context,msg: &Message,mut args: Args) -> CommandResult {
     let arg1 = match args.single::<String>(){
         Ok(str) => str,
         Err(_) => "iota".to_string()
@@ -503,9 +553,9 @@ async fn price(ctx: &Context,msg: &Message,mut args: Args) -> CommandResult {
     let coin_id:String;
     {   
         let id_map =  match context_data.get::<CoingeckoIDMap>(){
-            Some(m) => m,
+            Some(m) => m.clone(),
             None => {
-              return  Err(CommandError::from("there was a problem fetching the ids hashmap--Internal error."))
+              return  Err(CommandError::from("there was a problem fetching the ids hashmap."))
         }};
 
         coin_id = match id_map.get(&arg1) {
@@ -513,9 +563,9 @@ async fn price(ctx: &Context,msg: &Message,mut args: Args) -> CommandResult {
             None => {
                 drop(id_map);
                 let name_map = match context_data.get::<NameCoingeckoIDMap>(){
-                    Some(m) => m,
+                    Some(m) => m.clone(),
                     None => {
-                        return Err(CommandError::from("there was a problem fetching the name hashmap--Internal error."))
+                        return Err(CommandError::from("there was a problem fetching the name hashmap."))
                 }};
                 let coin_id = match name_map.get(&arg1) {
                     Some(v) => v.clone(),
@@ -524,7 +574,7 @@ async fn price(ctx: &Context,msg: &Message,mut args: Args) -> CommandResult {
                         let symbol_map = match context_data.get::<SymbolCoingeckoIDMap>(){
                             Some(m) => m,
                             None => 
-                                return Err(CommandError::from("there was a problem fetching the symbols hashmap--Internal error.")) 
+                                return Err(CommandError::from("there was a problem fetching the symbols hashmap.")) 
                             };                
                         let coin_id = match symbol_map.get(&arg1) {
                             Some(v) => v.clone(),
@@ -538,65 +588,55 @@ async fn price(ctx: &Context,msg: &Message,mut args: Args) -> CommandResult {
     }
     let coin:coingecko::CoinsItem;
     {
-        let coingecko_client = match context_data.get::<GeckoClient>(){
-            Some(c) => c,
-            None => return Err(CommandError::from( "There was a problem while fetching coingecko client from context data--Internal error."))
+        let redis_client =  match context_data.get::<RedisClient>(){
+            Some(r) => r.clone(),
+            None => return Err(CommandError::from("there was a problem getting redis client."))
         };
-        let coins_lock = match context_data.get::<CoingeckoCoins>(){
-            Some(m) => m,
-            None => return Err(CommandError::from( "There was a problem fetching the coins hashmap--Internal error."))
-           };
-        let map_coins_read_lock = coins_lock.read().await;
+        let mut con = match redis_client.get_connection(){
+            Ok(c) => c,
+            Err(y) => return Err(CommandError::from(format!("{}",y.to_string().to_lowercase())))
+        };
 
-        coin = match map_coins_read_lock.get(&coin_id)  {
-            Some(c) => {
-                let d = time::Instant::now().duration_since(c.updated_at);
-                if d.as_secs() > 300 {
-                    drop(map_coins_read_lock);
-                    let mut map = coins_lock.write().await;
+        let coin_redis_resp:Option<String> = match con.json_get(format!("crypto:{coin_id}:{arg2}"), "$"){
+            Ok(c) => c,
+            Err(y) => if let ErrorKind::TypeError = y.kind() {
+                None
+            }else{
+                return Err(CommandError::from(format!("{}",y.to_string().to_lowercase())))
+            }
+        };
 
-                    match map.get_mut(&coin_id){
-                        Some(coin) => {
-                            match coingecko_client.coin(coin_id.as_str(), false, false, true, false, false, false).await{
-                                Ok(data) => {
-                                    *coin = CoinInfo{coins_item: data.clone(),updated_at: time::Instant::now()};
-                                    debug!("requested and updated {}",&coin_id);
-                                    data.clone()
-                                }
-                                Err(y) => return Err(CommandError::from(y))
-                            }
+        match coin_redis_resp {
+            Some(c) =>{
+                let c:Vec<coingecko::CoinsItem> = serde_json::from_str(&c)?;
+                coin = c[0].clone();
+                debug!("used cache for {coin_id}.")
+            }None =>{
+                let coingecko_client = match context_data.get::<GeckoClient>(){
+                    Some(c) => c.clone(),
+                    None => return Err(CommandError::from("aoushioausbd"))
+                };
+                match coingecko_client.coin(coin_id.as_str(), false, false, true, false, false, false).await{
+                    Ok(c) => {
+                        coin = c.clone();
+                        match con.json_set(format!("crypto:{coin_id}:{arg2}"), "$",&c){
+                            Ok(()) => match con.expire(format!("crypto:{coin_id}:{arg2}"), 300) {
+                                Ok(()) =>  debug!("stored new cache for {coin_id}."),
+                                Err(y) => error!("{y}")
+                            },
+                            Err(y) => error!("{y}")
                         }
-                        None => return Err(CommandError::from(format!("no coin '{coin_id}' entry on mut write coins hashmap found somehow--Internal error.")))
                     }
-                }else{
-                    debug!("cache for {} used.",&coin_id);
-                    let c = c.coins_item.clone();
-                    drop(map_coins_read_lock);
-                    c
+                    Err(y) => return Err(CommandError::from(format!("{}",y.to_string().to_lowercase())))
                 }
             }
-            None => 
-                {
-                drop(map_coins_read_lock);
-                let mut map = coins_lock.write().await;
-        
-                match coingecko_client.coin(coin_id.as_str(), false, false, true, false, false, false).await{
-                    Ok(data) => {
-                        let coin = CoinInfo{coins_item: data.clone(),updated_at: time::Instant::now()};
-                        debug!("requested and inserted new {} info",&coin_id);
-                        map.insert(data.id.clone(), coin);
-                        data.clone()
-                    }
-                    Err(y) => return Err(CommandError::from(format!("{y}--Internal error.")))
-                }           
-            }             
-        }; 
+        }        
     }
     drop(context_data);
       
    let market_data = match coin.market_data{
     Some(data) => data,
-    None => return Err(CommandError::from("error while fetching market data--Internal error."))
+    None => return Err(CommandError::from("error while fetching market data."))
     };
    
     let price = match market_data.current_price.gets(&arg2){
@@ -604,7 +644,7 @@ async fn price(ctx: &Context,msg: &Message,mut args: Args) -> CommandResult {
             Some(d) => d.clone(),
             None => return Err(CommandError::from("Quote currency not supported."))
         },
-        Err(y) => return Err(CommandError::from(y))
+        Err(y) => return Err(CommandError::from(format!("{}",y.to_string().to_lowercase())))
     };
 
     let ath = match market_data.ath.gets(&arg2){
@@ -612,7 +652,7 @@ async fn price(ctx: &Context,msg: &Message,mut args: Args) -> CommandResult {
             Some(d) => d.clone(),
             None => return Err(CommandError::from("Quote currency not supported."))
         },
-        Err(y) => return Err(CommandError::from(y))
+        Err(y) => return Err(CommandError::from(format!("{}",y.to_string().to_lowercase())))
     };
 
     let atl = match market_data.atl.gets(&arg2){
@@ -620,7 +660,7 @@ async fn price(ctx: &Context,msg: &Message,mut args: Args) -> CommandResult {
             Some(d) => d.clone(),
             None => return Err(CommandError::from("Quote currency not supported."))
         },
-        Err(y) => return Err(CommandError::from(y))
+        Err(y) => return Err(CommandError::from(format!("{}",y.to_string().to_lowercase())))
     };
 
     let one_hour = match market_data.price_change_percentage1_h_in_currency{
@@ -629,7 +669,7 @@ async fn price(ctx: &Context,msg: &Message,mut args: Args) -> CommandResult {
                 Some(d) => d.clone(),
                 None => return Err(CommandError::from("Quote currency not supported."))
                 },
-            Err(y) => return Err(CommandError::from(y)),
+            Err(y) => return Err(CommandError::from(format!("{}",y.to_string().to_lowercase()))),
             }
         None => return Err(CommandError::from("Quote currency not supported."))
     };
@@ -640,25 +680,126 @@ async fn price(ctx: &Context,msg: &Message,mut args: Args) -> CommandResult {
                 Some(d) => d.clone(),
                 None => return Err(CommandError::from("Quote currency not supported."))
                 },
-            Err(y) => return Err(CommandError::from(y)),
+            Err(y) => return Err(CommandError::from(format!("{}",y.to_string().to_lowercase()))),
             }
         None => return Err(CommandError::from("Quote currency not supported."))
     };
 
     let image = match coin.image.thumb{
         Some(data)=> data,
-        None => return Err(CommandError::from("failed to fetch image--Internal error."))
+        None => return Err(CommandError::from("failed to fetch image."))
     };
    
     msg.channel_id.send_message(ctx, |c|
         c.add_embed(|e|
             e.thumbnail(image).description(format!(
-            "** ​​  ​​ {} ({})** #{}\n\n** ​​ {} {} {}**\n```24h: {}%\n1h:  {}%\nATH:{} ATL:{}```",
+            "** ​​  ​​ {} ({})** #{}\n\n** ​​ {}  ​​  {} {}**\n```24h: {}%\n1h:  {}%```",
             coin.name, coin.symbol, market_data.market_cap_rank,check_direction(&one_day,false),format_price(price).separate_with_commas(),
-            arg2.to_uppercase(),add_sign(one_day),add_sign(one_hour),format_price(ath),format_price(atl))))
+            arg2.to_uppercase(),add_sign(one_day),add_sign(one_hour))
+        ).footer(|f|f.text(format!("ATH: {} ​​  ATL: {}",format_price(ath),format_price(atl)))))
         ).await?;
     
    Ok(())
+}
+
+
+#[command]
+#[aliases("s")]
+#[bucket = "price" ]
+#[description = "pulls stonk price from twelvedata."]
+#[example = ".s amzn"]
+#[example = ".s gld"]
+async fn stonk_price(ctx: &Context,msg: &Message,mut args: Args) -> CommandResult {
+    let stonk_symbol = match args.single::<String>(){
+        Ok(str) => str,
+        Err(_) => "SPX".to_string()
+    };
+    let country = match args.remains(){
+        Some(str) => {if str.to_lowercase() != "united states" {
+            return Err(CommandError::from("Only United States market is available for now."))
+        }else{
+            str.to_owned().to_lowercase()
+        }},
+        None => "united states".to_owned()
+    };
+
+    let context_data = ctx.data.read().await;
+    {   
+        let countries_map =  match context_data.get::<CountriesMap>(){
+            Some(m) => m.clone(),
+            None => return Err(CommandError::from("there was a problem fetching the exchanges hashmap."))
+        };
+
+        let stonks_map = match countries_map.get(&country){
+            Some(m) => m,
+            None => return Err(CommandError::from("Country not found."))
+        };
+
+        if !stonks_map.contains(&stonk_symbol.to_lowercase()){
+            return Err(CommandError::from("Stock not found."))
+        };
+    }
+
+    let stonk:twelvedata::Stock;
+    {
+        let redis_client =  match context_data.get::<RedisClient>(){
+            Some(r) => r.clone(),
+            None => return Err(CommandError::from("there was a problem getting redis client."))
+        };
+        let mut con = match redis_client.get_connection(){
+            Ok(c) => c,
+            Err(y) => return Err(CommandError::from(format!("{}",y.to_string().to_lowercase())))
+        };
+
+        let coin_redis_resp:Option<String> = match con.json_get(format!("stock:{stonk_symbol}:{country}"), "$"){
+            Ok(c) => c,
+            Err(y) => if let ErrorKind::TypeError = y.kind() {
+                None
+            }else{
+                return Err(CommandError::from(format!("{}",y.to_string().to_lowercase())))
+            }
+        };
+
+        match coin_redis_resp {
+            Some(s) =>{
+                let s:Vec<twelvedata::Stock> = serde_json::from_str(&s)?;
+                stonk = s[0].clone();
+                debug!("used cache for {stonk_symbol}:{country}.")
+            }None =>{
+                let stonk_client = match context_data.get::<StonksClient>(){
+                   Some(c) => c.clone(),
+                   None => return Err(CommandError::from("there was a problem while fetching coingecko client from context data."))
+                };
+                match stonk_client.stock_quote(&stonk_symbol.to_lowercase(), &country.to_lowercase()).await{
+                    Ok(s) => {
+                        stonk = s.clone();
+                        match con.json_set(format!("stock:{stonk_symbol}:{country}"), "$",&s){
+                            Ok(()) => match con.expire(format!("stock:{stonk_symbol}:{country}"), 300) {
+                                Ok(()) =>  debug!("stored new cache for {stonk_symbol}:{country}."),
+                                Err(y) => error!("{}",y)
+                            },
+                            Err(y) => error!("{}",y)
+                        }
+                    }
+                    Err(y) => return Err(CommandError::from(format!("{}",y.to_string().to_lowercase())))
+                }
+            }
+        }        
+        
+    }
+    drop(context_data);
+    msg.channel_id.send_message(ctx, |c|
+        c.add_embed(|e| 
+            e.description(format!(
+            "** ​​  ​​ {} ​​  ​​  ​​ ({})**\n\n** ​​ {} ​​ {} {}**\n```24h: {}%```",
+            stonk.name.clone(), stonk.symbol.clone(),
+            check_direction(&stonk.percent_change.clone().parse().unwrap(),false),format_price(stonk.close.clone().parse().unwrap()).separate_with_commas(),stonk.currency.to_uppercase(),
+            add_sign(stonk.percent_change.clone().parse().unwrap()),
+            )).footer(|f|f.text(format!(" ​​  ​​ exchange: ​​  {}",stonk.exchange)))
+        )
+    ).await?;
+    
+    Ok(())
 }
 
 fn format_price(price: f64)-> String{
