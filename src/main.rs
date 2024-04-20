@@ -135,7 +135,11 @@ impl EventHandler for Handler {
                 let mut coin:Option<coingecko::CoinsItem> = None;
     
                 loop {
-                    let msg = socket.read_message().expect("Error reading message");
+                    let msg:tungstenite::protocol::Message;
+                    match socket.read_message(){
+                        Ok(m) => msg = m,
+                        Err(_) => break,
+                    }
                 
                     match msg {
                         TunMessage::Text(t) =>{
