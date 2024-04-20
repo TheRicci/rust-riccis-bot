@@ -2,14 +2,16 @@ mod commands;
 mod coingecko;
 mod twelvedata;
 
+use coingecko::CoinsListItem;
 use rand::Rng;
 use dotenv;
 use log::{info, error,debug};
 use std::collections::{HashMap, HashSet};
+use std::io::{Read, Write};
 use std::{env, vec};
 use std::sync::Arc;
 use serenity::model::application::interaction::{Interaction, InteractionResponseType,MessageFlags};
-use std::{time,thread};
+use std::{time,thread,time::Duration};
 use thousands::Separable;
 use serenity::model::application::command::Command;
 use serenity::async_trait;
@@ -31,6 +33,7 @@ use serenity::framework::standard::{
 };
 use serenity::model::id::CommandId;
 
+use std::fs::{File, OpenOptions};
 use url::Url;
 use tungstenite::connect;
 use tungstenite::Message as TunMessage;
@@ -39,7 +42,7 @@ use serenity::model::channel::{Channel, Message};
 use serenity::model::gateway::{GatewayIntents, Ready};
 use serenity::model::id::UserId;
 use serenity::prelude::*;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex,RwLock};
 
 use redis::{Commands, JsonCommands, ErrorKind};
 
@@ -71,17 +74,17 @@ impl TypeMapKey for CountriesMap {
 
 struct CoingeckoIDMap;
 impl TypeMapKey for CoingeckoIDMap {
-    type Value = Arc<HashMap<String, String>>;
+    type Value = Arc<RwLock<HashMap<String, String>>>;
 }
 
 struct SymbolCoingeckoIDMap;
 impl TypeMapKey for SymbolCoingeckoIDMap {
-    type Value = Arc<HashMap<String, String>>;
+    type Value = Arc<RwLock<HashMap<String, String>>>;
 }
 
 struct NameCoingeckoIDMap;
 impl TypeMapKey for NameCoingeckoIDMap {
-    type Value = Arc<HashMap<String, String>>;
+    type Value = Arc<RwLock<HashMap<String, String>>>;
 }
 
 struct Handler;
@@ -125,7 +128,7 @@ impl EventHandler for Handler {
         tokio::spawn(async move {
             loop{
                 let (mut socket, _) = connect(
-                    Url::parse("wss://stream.binance.com:9443/ws/bitcoinusdt@kline_1s").unwrap()
+                    Url::parse("wss://stream.binance.com:9443/ws/btcusdt@kline_1s").unwrap()
                 ).expect("Can't connect to binance.");
                 
                 let (mut timer1, mut timer2) = (time::Instant::now(), time::Instant::now());
@@ -318,7 +321,64 @@ async fn dispatch_error(ctx: &Context, msg: &Message, error: DispatchError, _com
 async fn main() {
     dotenv::dotenv().ok();
     env_logger::init();
+    let coingecko_client = coingecko::CoinGeckoClient::new("https://api.coingecko.com/api/v3");
+
+    let mut coins_map_id: HashMap<String,String> = HashMap::default();
+    let mut coins_map_name: HashMap<String,String> = HashMap::default();
+    let mut coins_map_symbol: HashMap<String,String> = HashMap::default();
     
+    let mut file = OpenOptions::new().read(true).open("coins.json").unwrap();
+    let mut json_string = String::new();
+    file.read_to_string(&mut json_string).unwrap();
+    
+    let deserialized_maps: Result<Vec<HashMap<String, String>>, _> = serde_json::from_str(&json_string);
+    match deserialized_maps {
+        Ok(maps) => {
+            coins_map_id = maps[0].clone();
+            coins_map_name = maps[1].clone();
+            coins_map_symbol = maps[2].clone();
+        }
+        Err(e) => {
+            println!("Error deserializing JSON: {}", e);
+        }
+    }
+    
+    let arc_id = Arc::new(RwLock::new(coins_map_id));
+    let arc_name = Arc::new(RwLock::new(coins_map_name));
+    let arc_symbol = Arc::new(RwLock::new(coins_map_symbol));
+
+    let (map_id1,map_name1,map_symbol1) = (arc_id.clone(),arc_name.clone(),arc_symbol.clone()); 
+    tokio::spawn(async move {
+        let mut i = 1;
+        loop {
+            match coingecko_client.coins_markets(i).await{
+                Ok(res) =>{
+                    if res.is_empty() {
+                        break;
+                    }
+                    { // code block to drop write locks
+                        let (mut id_write,mut name_write,mut symbol_write) = (map_id1.write().await,map_name1.write().await,map_symbol1.write().await);
+                        for data in res {
+                            id_write.insert(data.id.clone(), data.id.clone());
+                            name_write.insert(data.name, data.id.clone());
+                            symbol_write.insert(data.symbol, data.id);
+                        }
+                        let list:Vec<HashMap<String,String>> = vec![id_write.clone(),name_write.clone(),symbol_write.clone()];
+                        let json_string = serde_json::to_string(&list).unwrap();
+                        let mut file = OpenOptions::new().write(true).open("coins.json").unwrap();
+                        let _ = file.write_all(json_string.as_bytes());
+                        
+                    }
+                    thread::sleep(Duration::from_secs(60));
+            
+                    i+=1;
+                }
+                Err(y) => {println!("{:?}",y);thread::sleep(Duration::from_secs(60));continue}
+            };
+           
+        }
+    });
+
     let token = env::var("DISCORD_TOKEN").expect("Expected a token in the environment");
     let http = Http::new(&token);
     
@@ -368,17 +428,6 @@ async fn main() {
     
     let redis_client = redis::Client::open("redis://127.0.0.1/").expect("failed to connect to connect to Redis");
     
-    let coingecko_client = coingecko::CoinGeckoClient::new("https://api.coingecko.com/api/v3");
-    let coins = coingecko_client.coins_list(false).await.expect("failed to fetch coins list");
-    let mut coins_map_symbol: HashMap<String,String> = HashMap::default();
-    let mut coins_map_name: HashMap<String,String> = HashMap::default();
-    let mut coins_map_id: HashMap<String,String> = HashMap::default();
-        for coin in coins{
-            coins_map_id.insert(coin.id.clone().to_lowercase(),  coin.id.clone());
-            coins_map_name.insert(coin.name.to_lowercase(),  coin.id.clone());
-            let _ = coins_map_symbol.entry(coin.symbol.to_lowercase()).or_insert(coin.id);
-        };
-    
     let twelvedata_client = twelvedata::TwelveDataClient::new("https://twelve-data1.p.rapidapi.com");
     let stocks = twelvedata_client.stocks_list().await.expect("failed to fetch stocks list");
     let indices = twelvedata_client.indices_list().await.expect("failed to fetch indices list");
@@ -404,9 +453,9 @@ async fn main() {
         let mut data = client.data.write().await;
         data.insert::<ShardManagerContainer>(Arc::clone(&client.shard_manager));
         data.insert::<GeckoClient>(Arc::new(coingecko_client));
-        data.insert::<CoingeckoIDMap>(Arc::new(coins_map_id));
-        data.insert::<SymbolCoingeckoIDMap>(Arc::new(coins_map_symbol));
-        data.insert::<NameCoingeckoIDMap>(Arc::new(coins_map_name));
+        data.insert::<CoingeckoIDMap>(arc_id.clone());
+        data.insert::<SymbolCoingeckoIDMap>(arc_symbol.clone());
+        data.insert::<NameCoingeckoIDMap>(arc_name.clone());
         data.insert::<StonksClient>(Arc::new(twelvedata_client));
         data.insert::<CountriesMap>(Arc::new(symbols_map));
         data.insert::<RedisClient>(Arc::new(redis_client))
@@ -416,6 +465,7 @@ async fn main() {
     if let Err(why) = client.start().await {
         error!("Client error: {:?}", why);
     }
+
 }
 
 #[command]
@@ -539,7 +589,7 @@ async fn slow_mode(ctx: &Context, msg: &Message, mut args: Args) -> CommandResul
 async fn crypto_price(ctx: &Context,msg: &Message,mut args: Args) -> CommandResult {
     let arg1 = match args.single::<String>(){
         Ok(str) => str,
-        Err(_) => "iota".to_string()
+        Err(_) => "bitcoin".to_string()
     };
     let arg2 = match args.single::<String>(){
         Ok(str) => match str.as_str() {
@@ -558,25 +608,28 @@ async fn crypto_price(ctx: &Context,msg: &Message,mut args: Args) -> CommandResu
               return  Err(CommandError::from("there was a problem fetching the ids hashmap."))
         }};
 
-        coin_id = match id_map.get(&arg1) {
+        let id_map_read = id_map.read().await;
+        coin_id = match id_map_read.get(&arg1) {
             Some(v) => v.clone(),
             None => {
-                drop(id_map);
+                drop(id_map_read);
                 let name_map = match context_data.get::<NameCoingeckoIDMap>(){
                     Some(m) => m.clone(),
                     None => {
                         return Err(CommandError::from("there was a problem fetching the name hashmap."))
                 }};
-                let coin_id = match name_map.get(&arg1) {
+                let name_map_read = name_map.read().await;
+                let coin_id = match name_map_read.get(&arg1) {
                     Some(v) => v.clone(),
                     None => {
-                        drop(name_map);
+                        drop(name_map_read);
                         let symbol_map = match context_data.get::<SymbolCoingeckoIDMap>(){
                             Some(m) => m,
                             None => 
                                 return Err(CommandError::from("there was a problem fetching the symbols hashmap.")) 
-                            };                
-                        let coin_id = match symbol_map.get(&arg1) {
+                            };
+                        let symbol_map_read = symbol_map.read().await;                    
+                        let coin_id = match symbol_map_read.get(&arg1) {
                             Some(v) => v.clone(),
                             None => return Err(CommandError::from("Coin not found."))
                             };

@@ -1,10 +1,15 @@
 
+use core::time;
+use std::borrow::BorrowMut;
+
 use reqwest::Error;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use field_accessor::FieldAccessor;
+use reqwest::header::HeaderMap;
 
+#[derive(Debug, Clone,Copy)]
 pub struct CoinGeckoClient {
     pub host: &'static str,
 }
@@ -15,10 +20,16 @@ impl CoinGeckoClient {
     }
 
     pub async fn get<R: DeserializeOwned>(&self, endpoint: &str) -> Result<R, Error> {
-        reqwest::get(format!("{host}/{ep}", host = self.host, ep = endpoint))
-            .await?
-            .json()
-            .await
+        let mut headers = HeaderMap::new();
+        headers.insert("User-Agent", "PostmanRuntime/7.37.0".parse().unwrap());
+
+        let res = reqwest::Client::new()
+            .get(format!("{host}/{ep}", host = self.host, ep = endpoint))
+            .headers(headers)
+            .send()
+            .await?;
+
+        res.json().await
     }
 
     pub async fn coins_list(&self, include_platform: bool) -> Result<Vec<CoinsListItem>, Error> {
@@ -39,7 +50,15 @@ impl CoinGeckoClient {
         let req = format!("/coins/{}?localization={}&tickers={}&market_data={}&community_data={}&developer_data={}&sparkline={}", id, localization, tickers, market_data, community_data, developer_data, sparkline);
         self.get(&req).await
     }
-  
+    
+    pub async fn coins_markets(
+        &self,
+        page: i64,
+    ) -> Result<Vec<CoinsListItem>, Error> {
+        let req = format!("coins/markets?vs_currency=usd&order=market_cap_desc&per_page=250&page={}", page);
+        self.get(&req).await
+    }
+
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
