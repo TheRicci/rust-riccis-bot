@@ -363,9 +363,9 @@ async fn main() {
                     { // code block to drop write locks
                         let (mut id_write,mut name_write,mut symbol_write) = (map_id1.write().await,map_name1.write().await,map_symbol1.write().await);
                         for data in res {
-                            id_write.insert(data.id.clone(), data.id.clone());
-                            name_write.insert(data.name, data.id.clone());
-                            symbol_write.insert(data.symbol, data.id);
+                            id_write.insert(data.id.clone().to_lowercase(), data.id.clone());
+                            name_write.insert(data.name.to_lowercase(), data.id.clone());
+                            symbol_write.insert(data.symbol.to_lowercase(), data.id);
                         }
                         let list:Vec<HashMap<String,String>> = vec![id_write.clone(),name_write.clone(),symbol_write.clone()];
                         let json_string = serde_json::to_string(&list).unwrap();
